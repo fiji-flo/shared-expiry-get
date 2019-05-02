@@ -1,0 +1,21 @@
+[package]
+name = "shared-expiry-get"
+version = "0.0.1"
+authors = ["Florian Merz <flomerz@gmail.com>"]
+edition = "2018"
+license = "MIT"
+repository = "https://github.com/fiji-flo/shared-expiry-get"
+documentation = "https://docs.rs/crate/shared-expiry-get"
+keywords = ["cache", "async", "concurrent"]
+categories = []
+readme = "README.md"
+include = ["Cargo.toml", "src/**/*.rs", "README.md", "LICENSE"]
+
+[dependencies]
+chrono = "0.4"
+failure = "0.1"
+failure_derive = "0.1"
+futures = "0.1"
+
+[dev-dependencies]
+futures-timer = "0.1.1"
