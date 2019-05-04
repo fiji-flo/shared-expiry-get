@@ -1,13 +1,9 @@
-extern crate chrono;
 #[macro_use]
 extern crate failure;
 extern crate futures;
-
 #[macro_use]
 extern crate failure_derive;
 
-use chrono::DateTime;
-use chrono::Utc;
 use failure::Error;
 use futures::future;
 use futures::future::Shared;
@@ -31,7 +27,7 @@ pub enum CondvarStoreError {
 }
 
 pub trait Expiry {
-    fn expiry(&self) -> DateTime<Utc>;
+    fn valid(&self) -> bool;
 }
 
 #[derive(Clone)]
@@ -101,8 +97,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
     }
 
     fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error>> {
-        let now = Utc::now();
-        if t.expiry() > now {
+        if t.valid() {
             Box::new(future::ok::<T, Error>(t))
         } else {
             Box::new(
@@ -130,8 +125,11 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
 
 #[cfg(test)]
 mod test {
+    extern crate chrono;
     extern crate futures_timer;
     use super::*;
+    use chrono::DateTime;
+    use chrono::Utc;
     use futures::future::SharedError;
     use futures::future::SharedItem;
     use futures_timer::Delay;
@@ -152,8 +150,8 @@ mod test {
     }
 
     impl Expiry for E1 {
-        fn expiry(&self) -> DateTime<Utc> {
-            self.expire
+        fn valid(&self) -> bool {
+            self.expire > Utc::now()
         }
     }
 
@@ -186,11 +184,10 @@ mod test {
 
     fn check_ok_and_expiry<T: Expiry + Clone + 'static>(
         t: Result<SharedItem<T>, SharedError<Error>>,
-        now: &DateTime<Utc>,
     ) {
         assert!(t.is_ok());
         let t = t.unwrap();
-        assert!(t.expiry() > *now);
+        assert!(t.valid());
     }
 
     fn check_counter(counter: &Arc<AtomicI64>, should: i64) {
@@ -204,9 +201,8 @@ mod test {
         };
         let counter = Arc::clone(&provider.counter);
         let rs = RemoteStore::new(provider);
-        let now = Utc::now();
         let c = rs.get().wait();
-        check_ok_and_expiry(c, &now);
+        check_ok_and_expiry(c);
 
         let mut threads = vec![];
         for _ in 0..10 {
@@ -214,14 +210,13 @@ mod test {
             let child = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(50));
                 let c = rs_c.get().wait();
-                check_ok_and_expiry(c, &now);
+                check_ok_and_expiry(c);
             });
             threads.push(child);
         }
 
-        let now = Utc::now();
         let c = rs.get().wait();
-        check_ok_and_expiry(c, &now);
+        check_ok_and_expiry(c);
 
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
         check_counter(&counter, 1);
@@ -232,11 +227,10 @@ mod test {
         let rs_c = rs.clone();
         let child = thread::spawn(move || {
             let c = rs_c.get().wait();
-            check_ok_and_expiry(c, &now);
+            check_ok_and_expiry(c);
         });
-        let now = Utc::now();
         let c = rs.get().wait();
-        check_ok_and_expiry(c, &now);
+        check_ok_and_expiry(c);
         assert!(child.join().is_ok());
         check_counter(&counter, 2);
     }
@@ -246,9 +240,8 @@ mod test {
         let rs = RemoteStore::new(P1 {
             counter: Arc::new(AtomicI64::default()),
         });
-        let now = Utc::now();
         let c = rs.get().wait();
-        check_ok_and_expiry(c, &now);
+        check_ok_and_expiry(c);
 
         let mut threads = vec![];
         for i in 0..30 {
@@ -256,7 +249,7 @@ mod test {
             let child = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(i * 10));
                 let c = rs_c.get().wait();
-                check_ok_and_expiry(c, &now);
+                check_ok_and_expiry(c);
             });
             threads.push(child);
         }

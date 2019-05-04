@@ -12,10 +12,10 @@ readme = "README.md"
 include = ["Cargo.toml", "src/**/*.rs", "README.md", "LICENSE"]
 
 [dependencies]
-chrono = "0.4"
 failure = "0.1"
 failure_derive = "0.1"
 futures = "0.1"
 
 [dev-dependencies]
+chrono = "0.4"
 futures-timer = "0.1.1"
