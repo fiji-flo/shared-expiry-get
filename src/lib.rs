@@ -159,7 +159,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Clone
 impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + 'static>
     RemoteStore<T, P>
 {
-    /// Wrap a [Provider](trait.Provider.html). 
+    /// Wrap a [Provider](trait.Provider.html).
     #[allow(clippy::mutex_atomic)]
     pub fn new(p: P) -> Self {
         let remote = Arc::new(RwLock::new(Fu {
