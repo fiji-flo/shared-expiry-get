@@ -1,4 +1,3 @@
-#[macro_use]
 extern crate failure;
 extern crate futures;
 #[macro_use]
@@ -22,6 +21,8 @@ pub enum CondvarStoreError {
     PoisonedLock(String),
     #[fail(display = "not initialized")]
     NotInitialized,
+    #[fail(display = "Inner update future failed")]
+    InnerFutureFailed,
     #[fail(display = "unknown error")]
     Unknown,
 }
@@ -114,21 +115,23 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
         } else {
             Box::new(
                 self.update()
-                    .map_err(move |_| format_err!("no inner"))
+                    .map_err(move |_| CondvarStoreError::InnerFutureFailed.into())
                     .map(|i| (*i).clone()),
             )
         }
     }
 
-    pub fn get(&self) -> Shared<Box<Future<Item = T, Error = Error>>> {
+    pub fn get(&self) -> Box<Future<Item = T, Error = Error>> {
         let s = (*self).clone();
         match self.remote.read() {
-            Ok(ref f) => Future::shared(Box::new(
+            Ok(ref f) => Box::new(
                 f.f.clone()
-                    .map_err(move |_| format_err!("no inner"))
+                    .map_err(move |_| CondvarStoreError::InnerFutureFailed.into())
                     .and_then(move |item| s.get_or_update((*item).clone())),
-            )),
-            Err(e) => poison_err_future!(e),
+            ),
+            Err(e) => Box::new(
+                future::err(CondvarStoreError::PoisonedLock(e.to_string()).into()).into_future(),
+            ),
         }
     }
 }
@@ -140,8 +143,6 @@ mod test_timed {
     use super::*;
     use chrono::DateTime;
     use chrono::Utc;
-    use futures::future::SharedError;
-    use futures::future::SharedItem;
     use futures_timer::Delay;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
@@ -164,9 +165,7 @@ mod test_timed {
         }
     }
 
-    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(
-        t: Result<SharedItem<T>, SharedError<Error>>,
-    ) {
+    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(t: Result<T, Error>) {
         assert!(t.is_ok());
         let t = t.unwrap();
         assert!(t.valid());
@@ -263,8 +262,6 @@ mod test_timed {
 #[cfg(test)]
 mod test_counted {
     use super::*;
-    use futures::future::SharedError;
-    use futures::future::SharedItem;
     use futures_timer::Delay;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
@@ -310,7 +307,7 @@ mod test_counted {
         }
     }
 
-    fn check_and_increment(t: Result<SharedItem<E2>, SharedError<Error>>) {
+    fn check_and_increment(t: Result<E2, Error>) {
         assert!(t.is_ok());
         let t = t.unwrap();
         (*t.counter).fetch_add(1, Ordering::SeqCst);
@@ -379,7 +376,7 @@ mod test_failing {
 
     impl Provider<E3> for P3 {
         fn update(&self) -> Box<Future<Item = E3, Error = Error> + Send> {
-            Box::new(future::err(format_err!("boom")).into_future())
+            Box::new(future::err(CondvarStoreError::InnerFutureFailed.into()).into_future())
         }
     }
 
