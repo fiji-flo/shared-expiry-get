@@ -6,6 +6,7 @@ extern crate failure_derive;
 use failure::Error;
 use futures::future;
 use futures::future::Shared;
+use futures::future::SharedError;
 use futures::Future;
 use futures::IntoFuture;
 use std::clone::Clone;
@@ -21,8 +22,8 @@ pub enum CondvarStoreError {
     PoisonedLock(String),
     #[fail(display = "not initialized")]
     NotInitialized,
-    #[fail(display = "Inner update future failed")]
-    InnerFutureFailed,
+    #[fail(display = "Inner update future failed: {}", _0)]
+    InnerFutureFailed(SharedError<Error>),
     #[fail(display = "unknown error")]
     Unknown,
 }
@@ -66,7 +67,9 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Clone
     }
 }
 
-impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> RemoteStore<T, P> {
+impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + 'static>
+    RemoteStore<T, P>
+{
     #[allow(clippy::mutex_atomic)]
     pub fn new(p: P) -> Self {
         let remote = Arc::new(RwLock::new(Fu {
@@ -101,7 +104,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
                     }
                 }
                 match self.remote.read() {
-                    Ok(r) => return r.f.clone(),
+                    Ok(r) => r.f.clone(),
                     Err(e) => return poison_err_future!(e),
                 }
             }
@@ -109,24 +112,24 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
         }
     }
 
-    fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error>> {
+    fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error> + Send> {
         if t.valid() {
             Box::new(future::ok::<T, Error>(t))
         } else {
             Box::new(
                 self.update()
-                    .map_err(move |_| CondvarStoreError::InnerFutureFailed.into())
+                    .map_err(|e| CondvarStoreError::InnerFutureFailed(e).into())
                     .map(|i| (*i).clone()),
             )
         }
     }
 
-    pub fn get(&self) -> Box<Future<Item = T, Error = Error>> {
+    pub fn get(&self) -> Box<Future<Item = T, Error = Error> + Send> {
         let s = (*self).clone();
         match self.remote.read() {
             Ok(ref f) => Box::new(
                 f.f.clone()
-                    .map_err(move |_| CondvarStoreError::InnerFutureFailed.into())
+                    .map_err(|e| CondvarStoreError::InnerFutureFailed(e).into())
                     .and_then(move |item| s.get_or_update((*item).clone())),
             ),
             Err(e) => Box::new(
@@ -156,7 +159,7 @@ mod test_timed {
     #[derive(Clone)]
     struct E1 {
         expire: DateTime<Utc>,
-        payload: usize,
+        payload: String,
     }
 
     impl Expiry for E1 {
@@ -182,7 +185,7 @@ mod test_timed {
                         c.fetch_add(1, Ordering::SeqCst);
                         E1 {
                             expire: Utc::now() + chrono::Duration::milliseconds(200),
-                            payload: 0,
+                            payload: String::from("foobar"),
                         }
                     })
                     .map_err(Into::into)
@@ -376,7 +379,7 @@ mod test_failing {
 
     impl Provider<E3> for P3 {
         fn update(&self) -> Box<Future<Item = E3, Error = Error> + Send> {
-            Box::new(future::err(CondvarStoreError::InnerFutureFailed.into()).into_future())
+            Box::new(future::err(CondvarStoreError::Unknown.into()).into_future())
         }
     }
 
