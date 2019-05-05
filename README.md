@@ -1,4 +1,4 @@
-# Simple concurrent async get with expiration for Rust
+# Simple concurrent async get with expiration for Rust.
 [![Build Status](https://travis-ci.org/fiji-flo/shared-expiry-get.svg?branch=master)](https://travis-ci.org/fiji-flo/shared-expiry-get)
 [![Latest Version](https://img.shields.io/crates/v/shared-expiry-get.svg)](https://crates.io/crates/shared-expiry-get)
 [![Docs](https://docs.rs/shared-expiry-get/badge.svg)](https://docs.rs/shared-expiry-get)
