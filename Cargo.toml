@@ -19,3 +19,4 @@ futures = "0.1"
 [dev-dependencies]
 chrono = "0.4"
 futures-timer = "0.1.1"
+tokio-fs = "0.1.6"

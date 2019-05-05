@@ -26,6 +26,14 @@ pub enum CondvarStoreError {
     Unknown,
 }
 
+macro_rules! poison_err_future {
+    ($e:ident) => {
+        Future::shared(Box::new(
+            future::err(CondvarStoreError::PoisonedLock($e.to_string()).into()).into_future(),
+        ))
+    };
+}
+
 pub trait Expiry {
     fn valid(&self) -> bool;
 }
@@ -71,29 +79,33 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
     }
 
     pub fn update(self) -> Shared<Box<Future<Item = T, Error = Error> + Send>> {
-        if let Ok(mut lock) = self.inflight.lock() {
-            if !*lock {
-                *lock = true;
-                if let Ok(mut r) = self.remote.write() {
-                    let unlock = Arc::clone(&self.inflight);
-                    let f = self.provider.update().then(move |f| {
-                        if let Ok(mut unlock) = unlock.lock() {
-                            *unlock = false;
+        match self.inflight.lock() {
+            Ok(mut lock) => {
+                if !*lock {
+                    *lock = true;
+                    match self.remote.write() {
+                        Ok(mut r) => {
+                            let unlock = Arc::clone(&self.inflight);
+                            let f = self.provider.update().then(move |f| {
+                                if let Ok(mut unlock) = unlock.lock() {
+                                    *unlock = false;
+                                }
+                                f
+                            });
+                            *r = Fu {
+                                f: Future::shared(Box::new(f)),
+                            };
                         }
-                        f
-                    });
-                    *r = Fu {
-                        f: Future::shared(Box::new(f)),
-                    };
+                        Err(e) => return poison_err_future!(e),
+                    }
+                }
+                match self.remote.read() {
+                    Ok(r) => return r.f.clone(),
+                    Err(e) => return poison_err_future!(e),
                 }
             }
-            if let Ok(r) = self.remote.read() {
-                return r.f.clone();
-            }
+            Err(e) => poison_err_future!(e),
         }
-        Future::shared(Box::new(
-            future::err(format_err!("no update")).into_future(),
-        ))
     }
 
     fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error>> {
@@ -116,15 +128,13 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Remote
                     .map_err(move |_| format_err!("no inner"))
                     .and_then(move |item| s.get_or_update((*item).clone())),
             )),
-            Err(e) => Future::shared(Box::new(
-                future::err(CondvarStoreError::PoisonedLock(e.to_string()).into()).into_future(),
-            )),
+            Err(e) => poison_err_future!(e),
         }
     }
 }
 
 #[cfg(test)]
-mod test {
+mod test_timed {
     extern crate chrono;
     extern crate futures_timer;
     use super::*;
@@ -141,7 +151,6 @@ mod test {
     struct P1 {
         counter: Arc<AtomicI64>,
     }
-    struct P2 {}
 
     #[derive(Clone)]
     struct E1 {
@@ -153,6 +162,14 @@ mod test {
         fn valid(&self) -> bool {
             self.expire > Utc::now()
         }
+    }
+
+    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(
+        t: Result<SharedItem<T>, SharedError<Error>>,
+    ) {
+        assert!(t.is_ok());
+        let t = t.unwrap();
+        assert!(t.valid());
     }
 
     impl Provider<E1> for P1 {
@@ -175,27 +192,12 @@ mod test {
         }
     }
 
-    impl Provider<E1> for P2 {
-        fn update(&self) -> Box<Future<Item = E1, Error = Error> + Send> {
-            println!("started update");
-            Box::new(future::err(format_err!("boom")).into_future())
-        }
-    }
-
-    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(
-        t: Result<SharedItem<T>, SharedError<Error>>,
-    ) {
-        assert!(t.is_ok());
-        let t = t.unwrap();
-        assert!(t.valid());
-    }
-
     fn check_counter(counter: &Arc<AtomicI64>, should: i64) {
         assert_eq!(counter.load(Ordering::SeqCst), should);
     }
 
     #[test]
-    fn works() {
+    fn threaded_with_ttl() {
         let provider = P1 {
             counter: Arc::new(AtomicI64::default()),
         };
@@ -257,9 +259,133 @@ mod test {
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
     }
 
+}
+#[cfg(test)]
+mod test_counted {
+    use super::*;
+    use futures::future::SharedError;
+    use futures::future::SharedItem;
+    use futures_timer::Delay;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    struct P2 {
+        counter: Arc<AtomicI64>,
+        valid_for: i64,
+    }
+
+    #[derive(Clone)]
+    struct E2 {
+        counter: Arc<AtomicI64>,
+        payload: usize,
+        valid_for: i64,
+    }
+
+    impl Expiry for E2 {
+        fn valid(&self) -> bool {
+            let c = self.counter.load(Ordering::SeqCst);
+            self.valid_for > c
+        }
+    }
+
+    impl Provider<E2> for P2 {
+        fn update(&self) -> Box<Future<Item = E2, Error = Error> + Send> {
+            let c = Arc::clone(&self.counter);
+            let valid_for = self.valid_for;
+            Box::new(
+                Delay::new(Duration::from_millis(10))
+                    .map(move |_| {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        E2 {
+                            counter: Arc::new(AtomicI64::new(0)),
+                            payload: 0,
+                            valid_for,
+                        }
+                    })
+                    .map_err(Into::into)
+                    .into_future(),
+            )
+        }
+    }
+
+    fn check_and_increment(t: Result<SharedItem<E2>, SharedError<Error>>) {
+        assert!(t.is_ok());
+        let t = t.unwrap();
+        (*t.counter).fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn check_counter(counter: &Arc<AtomicI64>, should: i64) {
+        assert_eq!(counter.load(Ordering::SeqCst), should);
+    }
+
+    #[test]
+    fn threaded_with_counter() {
+        let provider = P2 {
+            counter: Arc::new(AtomicI64::default()),
+            valid_for: 10,
+        };
+        let counter = Arc::clone(&provider.counter);
+        let rs = RemoteStore::new(provider);
+        let c = rs.get().wait();
+        check_and_increment(c);
+        check_counter(&counter, 1);
+
+        let mut threads = vec![];
+        for _ in 0..8 {
+            let rs_c = rs.clone();
+            let child = thread::spawn(move || {
+                let c = rs_c.get().wait();
+                check_and_increment(c);
+            });
+            threads.push(child);
+        }
+
+        let c = rs.get().wait();
+        check_and_increment(c);
+
+        assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
+        check_counter(&counter, 1);
+
+        let rs_c = rs.clone();
+        let child = thread::spawn(move || {
+            let c = rs_c.get().wait();
+            check_and_increment(c);
+        });
+        let c = rs.get().wait();
+        check_and_increment(c);
+        assert!(child.join().is_ok());
+        check_counter(&counter, 2);
+    }
+}
+
+#[cfg(test)]
+mod test_failing {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct P3 {}
+    #[derive(Clone)]
+    struct E3 {}
+
+    impl Expiry for E3 {
+        fn valid(&self) -> bool {
+            true
+        }
+    }
+
+    impl Provider<E3> for P3 {
+        fn update(&self) -> Box<Future<Item = E3, Error = Error> + Send> {
+            Box::new(future::err(format_err!("boom")).into_future())
+        }
+    }
+
     #[test]
     fn many_threads_fail() {
-        let rs = RemoteStore::new(P2 {});
+        let rs = RemoteStore::new(P3 {});
         let _ = rs.get().wait();
 
         let mut threads = vec![];
