@@ -1,3 +1,42 @@
+//! # shared-expiry-get
+//! `shared-expiry-get` is a wrapper for accessing and caching a remote data source with some
+//! expiration criteria.
+//!
+//! # A basic Example
+//!
+//! ```
+//! use failure::Error;
+//! use futures::future;
+//! use futures::future::IntoFuture;
+//! use futures::Future;
+//!
+//! use shared_expiry_get::Expiry;
+//! use shared_expiry_get::Provider;
+//! use shared_expiry_get::RemoteStore;
+//!
+//! #[derive(Clone)]
+//! struct MyProvider {}
+//! #[derive(Clone)]
+//! struct Payload {}
+//!
+//! impl Expiry for Payload {
+//!     fn valid(&self) -> bool {
+//!         true
+//!     }
+//! }
+//!
+//! impl Provider<Payload> for MyProvider {
+//!     fn update(&self) -> Box<Future<Item = Payload, Error = Error> + Send> {
+//!         Box::new(future::ok(Payload {}).into_future())
+//!     }
+//! }
+//!
+//! fn main() {
+//!     let rs = RemoteStore::new(MyProvider {});
+//!     let payload = rs.get().wait();
+//!     assert!(payload.is_ok());
+//! }
+//! ```
 extern crate failure;
 extern crate futures;
 #[macro_use]
@@ -14,45 +53,95 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+/// Various internal errors.
 #[derive(Debug, Fail)]
-pub enum CondvarStoreError {
-    #[fail(display = "Timeout while waiting for GET")]
-    GetTimeout,
+pub enum ExpiryGetError {
+    /// Internal `Mutex` or `RwLock` is poisoned.
     #[fail(display = "Poisoned lock: {}", _0)]
     PoisonedLock(String),
+    /// First `get` happened before initialization. This must not happen.
     #[fail(display = "not initialized")]
     NotInitialized,
+    /// Something went wrong during update. Maybe a timeout or invalid data.
     #[fail(display = "Inner update future failed: {}", _0)]
     InnerFutureFailed(SharedError<Error>),
-    #[fail(display = "unknown error")]
-    Unknown,
 }
 
 macro_rules! poison_err_future {
     ($e:ident) => {
         Future::shared(Box::new(
-            future::err(CondvarStoreError::PoisonedLock($e.to_string()).into()).into_future(),
+            future::err(ExpiryGetError::PoisonedLock($e.to_string()).into()).into_future(),
         ))
     };
 }
 
+/// Used to determine whether the remote data is still valid.
 pub trait Expiry {
+    /// Return whether the remote data is still valid.
+    ///
+    /// Example:
+    /// ```
+    /// # use chrono::{DateTime, Utc};
+    /// # use shared_expiry_get::Expiry;
+    ///
+    /// #[derive(Clone)]
+    /// struct E {
+    ///     expire: DateTime<Utc>,
+    ///     payload: String,
+    /// }
+    /// impl Expiry for E {
+    ///     fn valid(&self) -> bool {
+    ///         self.expire > Utc::now()
+    ///     }
+    /// }
+    /// ```
     fn valid(&self) -> bool;
 }
 
 #[derive(Clone)]
-pub struct Fu<T: Expiry + Clone + 'static> {
+struct Fu<T: Expiry + Clone + 'static> {
     pub f: Shared<Box<Future<Item = T, Error = Error> + Send>>,
 }
 
+/// Provides updates to _get_ remote data.
 pub trait Provider<T: Expiry + Clone + 'static> {
+    /// Provide a updated version of the remote data. E.g via an async http get.
+    ///
+    /// Example:
+    /// ```
+    /// # use failure::Error;
+    /// # use futures::future;
+    /// # use futures::future::IntoFuture;
+    /// # use futures::Future;
+    /// # use shared_expiry_get::Expiry;
+    /// # use shared_expiry_get::Provider;
+    /// # use shared_expiry_get::RemoteStore;
+    ///
+    /// # #[derive(Clone)]
+    /// # struct Payload {}
+    /// # impl Expiry for Payload {
+    /// #     fn valid(&self) -> bool {
+    /// #         true
+    /// #     }
+    /// # }
+    /// #[derive(Clone)]
+    /// struct MyProvider {}
+    ///
+    /// impl Provider<Payload> for MyProvider {
+    ///     fn update(&self) -> Box<Future<Item = Payload, Error = Error> + Send> {
+    ///         Box::new(future::ok(Payload {}).into_future())
+    ///     }
+    /// }
+    /// ```
     fn update(&self) -> Box<Future<Item = T, Error = Error> + Send>;
 }
 
+/// A remote store wrapping an updated provider ([`impl Provider`](trait.Provider.html)) and
+/// remote data type ([`impl Expiry`](trait.Expiry.html)).
 pub struct RemoteStore<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> {
-    pub provider: Arc<P>,
-    pub remote: Arc<RwLock<Fu<T>>>,
-    pub inflight: Arc<Mutex<bool>>,
+    provider: Arc<P>,
+    remote: Arc<RwLock<Fu<T>>>,
+    inflight: Arc<Mutex<bool>>,
 }
 
 impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Clone
@@ -70,6 +159,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + 'static> Clone
 impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + 'static>
     RemoteStore<T, P>
 {
+    /// Wrap a [Provider](trait.Provider.html). 
     #[allow(clippy::mutex_atomic)]
     pub fn new(p: P) -> Self {
         let remote = Arc::new(RwLock::new(Fu {
@@ -82,7 +172,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
         }
     }
 
-    pub fn update(self) -> Shared<Box<Future<Item = T, Error = Error> + Send>> {
+    fn update(self) -> Shared<Box<Future<Item = T, Error = Error> + Send>> {
         match self.inflight.lock() {
             Ok(mut lock) => {
                 if !*lock {
@@ -118,22 +208,24 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
         } else {
             Box::new(
                 self.update()
-                    .map_err(|e| CondvarStoreError::InnerFutureFailed(e).into())
+                    .map_err(|e| ExpiryGetError::InnerFutureFailed(e).into())
                     .map(|i| (*i).clone()),
             )
         }
     }
 
+    /// Retrieve the remote data implementing [Expiry](trait.Expiry.html). This will either return
+    /// cached data or retrieve new data via the [Provider](trait.Provider.html).
     pub fn get(&self) -> Box<Future<Item = T, Error = Error> + Send> {
         let s = (*self).clone();
         match self.remote.read() {
             Ok(ref f) => Box::new(
                 f.f.clone()
-                    .map_err(|e| CondvarStoreError::InnerFutureFailed(e).into())
+                    .map_err(|e| ExpiryGetError::InnerFutureFailed(e).into())
                     .and_then(move |item| s.get_or_update((*item).clone())),
             ),
             Err(e) => Box::new(
-                future::err(CondvarStoreError::PoisonedLock(e.to_string()).into()).into_future(),
+                future::err(ExpiryGetError::PoisonedLock(e.to_string()).into()).into_future(),
             ),
         }
     }
@@ -379,7 +471,7 @@ mod test_failing {
 
     impl Provider<E3> for P3 {
         fn update(&self) -> Box<Future<Item = E3, Error = Error> + Send> {
-            Box::new(future::err(CondvarStoreError::Unknown.into()).into_future())
+            Box::new(future::err(ExpiryGetError::NotInitialized.into()).into_future())
         }
     }
 
