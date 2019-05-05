@@ -41,6 +41,8 @@ extern crate failure;
 extern crate futures;
 #[macro_use]
 extern crate failure_derive;
+#[macro_use]
+extern crate log;
 
 use failure::Error;
 use futures::future;
@@ -68,11 +70,12 @@ pub enum ExpiryGetError {
 }
 
 macro_rules! poison_err_future {
-    ($e:ident) => {
+    ($e:ident) => {{
+        error!("poisoned lock: {}", $e);
         Future::shared(Box::new(
             future::err(ExpiryGetError::PoisonedLock($e.to_string()).into()).into_future(),
         ))
-    };
+    }};
 }
 
 /// Used to determine whether the remote data is still valid.
@@ -177,6 +180,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
             Ok(mut lock) => {
                 if !*lock {
                     *lock = true;
+                    info!("updating from remote");
                     match self.remote.write() {
                         Ok(mut r) => {
                             let unlock = Arc::clone(&self.inflight);
@@ -192,6 +196,8 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
                         }
                         Err(e) => return poison_err_future!(e),
                     }
+                } else {
+                    debug!("update ongoing")
                 }
                 match self.remote.read() {
                     Ok(r) => r.f.clone(),
@@ -204,6 +210,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
 
     fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error> + Send> {
         if t.valid() {
+            debug!("reusing cached data");
             Box::new(future::ok::<T, Error>(t))
         } else {
             Box::new(
