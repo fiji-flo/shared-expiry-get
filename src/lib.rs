@@ -5,12 +5,17 @@
 //! # A basic Example
 //!
 //! ```
-//! use failure::Error;
+//! #[allow(clippy::needless_doctest_main)]
+//! use futures::executor::block_on;
 //! use futures::future;
+//! use futures::future::FutureExt;
 //! use futures::future::IntoFuture;
+//! use futures::future::TryFutureExt;
 //! use futures::Future;
+//! use std::pin::Pin;
 //!
 //! use shared_expiry_get::Expiry;
+//! use shared_expiry_get::ExpiryGetError;
 //! use shared_expiry_get::Provider;
 //! use shared_expiry_get::RemoteStore;
 //!
@@ -26,16 +31,16 @@
 //! }
 //!
 //! impl Provider<Payload> for MyProvider {
-//!     fn update(&self) -> Box<Future<Item = Payload, Error = Error> + Send> {
-//!         Box::new(future::ok(Payload {}).into_future())
+//!     fn update(&self) -> Pin<Box<dyn Future<Output = Result<Payload, ExpiryGetError>> + Send>> {
+//!         future::ok::<Payload, ExpiryGetError>(Payload {}).into_future().boxed()
 //!     }
 //! }
 //!
-//! fn main() {
-//!     let rs = RemoteStore::new(MyProvider {});
-//!     let payload = rs.get().wait();
-//!     assert!(payload.is_ok());
-//! }
+//!
+//! let rs = RemoteStore::new(MyProvider {});
+//! let payload = block_on(rs.get());
+//! assert!(payload.is_ok());
+//!
 //! ```
 extern crate failure;
 extern crate futures;
@@ -44,19 +49,19 @@ extern crate failure_derive;
 #[macro_use]
 extern crate log;
 
-use failure::Error;
 use futures::future;
+use futures::future::FutureExt;
 use futures::future::Shared;
-use futures::future::SharedError;
-use futures::Future;
-use futures::IntoFuture;
+use futures::future::TryFutureExt;
 use std::clone::Clone;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
 /// Various internal errors.
-#[derive(Debug, Fail)]
+#[derive(Debug, Fail, Clone)]
 pub enum ExpiryGetError {
     /// Internal `Mutex` or `RwLock` is poisoned.
     #[fail(display = "Poisoned lock: {}", _0)]
@@ -66,15 +71,19 @@ pub enum ExpiryGetError {
     NotInitialized,
     /// Something went wrong during update. Maybe a timeout or invalid data.
     #[fail(display = "Inner update future failed: {}", _0)]
-    InnerFutureFailed(SharedError<Error>),
+    InnerFutureFailed(String),
+    #[fail(display = "Update failed: {}", _0)]
+    UpdateFailed(String),
 }
+
+pub type ExpiryFut<T> = Pin<Box<dyn Future<Output = Result<T, ExpiryGetError>> + Send>>;
 
 macro_rules! poison_err_future {
     ($e:ident) => {{
         error!("poisoned lock: {}", $e);
-        Future::shared(Box::new(
-            future::err(ExpiryGetError::PoisonedLock($e.to_string()).into()).into_future(),
-        ))
+        future::err(ExpiryGetError::PoisonedLock($e.to_string()).into())
+            .boxed()
+            .shared()
     }};
 }
 
@@ -102,8 +111,8 @@ pub trait Expiry {
 }
 
 #[derive(Clone)]
-struct Fu<T: Expiry + Clone + 'static> {
-    pub f: Shared<Box<Future<Item = T, Error = Error> + Send>>,
+struct Fu<T: Expiry + Clone + Send + 'static> {
+    pub f: Shared<ExpiryFut<T>>,
 }
 
 /// Provides updates to _get_ remote data.
@@ -114,9 +123,14 @@ pub trait Provider<T: Expiry + Clone + 'static> {
     /// ```
     /// # use failure::Error;
     /// # use futures::future;
+    /// # use futures::future::FutureExt;
     /// # use futures::future::IntoFuture;
+    /// # use futures::future::TryFutureExt;
     /// # use futures::Future;
+    /// # use std::pin::Pin;
+    ///
     /// # use shared_expiry_get::Expiry;
+    /// # use shared_expiry_get::ExpiryGetError;
     /// # use shared_expiry_get::Provider;
     /// # use shared_expiry_get::RemoteStore;
     ///
@@ -131,12 +145,12 @@ pub trait Provider<T: Expiry + Clone + 'static> {
     /// struct MyProvider {}
     ///
     /// impl Provider<Payload> for MyProvider {
-    ///     fn update(&self) -> Box<Future<Item = Payload, Error = Error> + Send> {
-    ///         Box::new(future::ok(Payload {}).into_future())
+    ///     fn update(&self) -> Pin<Box<dyn Future<Output = Result<Payload, ExpiryGetError>> + Send>> {
+    ///         future::ok::<Payload, ExpiryGetError>(Payload {}).into_future().boxed()
     ///     }
     /// }
     /// ```
-    fn update(&self) -> Box<Future<Item = T, Error = Error> + Send>;
+    fn update(&self) -> ExpiryFut<T>;
 }
 
 /// A remote store wrapping an updated provider ([`impl Provider`](trait.Provider.html)) and
@@ -166,7 +180,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
     #[allow(clippy::mutex_atomic)]
     pub fn new(p: P) -> Self {
         let remote = Arc::new(RwLock::new(Fu {
-            f: Future::shared(p.update()),
+            f: FutureExt::shared(p.update()),
         }));
         RemoteStore {
             provider: Arc::new(p),
@@ -175,7 +189,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
         }
     }
 
-    fn update(self) -> Shared<Box<Future<Item = T, Error = Error> + Send>> {
+    fn update(self) -> Shared<ExpiryFut<T>> {
         match self.inflight.lock() {
             Ok(mut lock) => {
                 if !*lock {
@@ -184,14 +198,14 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
                     match self.remote.write() {
                         Ok(mut r) => {
                             let unlock = Arc::clone(&self.inflight);
-                            let f = self.provider.update().then(move |f| {
+                            let f = self.provider.update().map(move |f| {
                                 if let Ok(mut unlock) = unlock.lock() {
                                     *unlock = false;
                                 }
                                 f
                             });
                             *r = Fu {
-                                f: Future::shared(Box::new(f)),
+                                f: FutureExt::shared(f.boxed()),
                             };
                         }
                         Err(e) => return poison_err_future!(e),
@@ -208,32 +222,29 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
         }
     }
 
-    fn get_or_update(self, t: T) -> Box<Future<Item = T, Error = Error> + Send> {
+    fn get_or_update(self, t: T) -> ExpiryFut<T> {
         if t.valid() {
             debug!("reusing cached data");
-            Box::new(future::ok::<T, Error>(t))
+            future::ok::<T, ExpiryGetError>(t).boxed()
         } else {
-            Box::new(
-                self.update()
-                    .map_err(|e| ExpiryGetError::InnerFutureFailed(e).into())
-                    .map(|i| (*i).clone()),
-            )
+            self.update()
+                .map_err(|e| ExpiryGetError::InnerFutureFailed(e.to_string()))
+                .boxed()
         }
     }
 
     /// Retrieve the remote data implementing [Expiry](trait.Expiry.html). This will either return
     /// cached data or retrieve new data via the [Provider](trait.Provider.html).
-    pub fn get(&self) -> Box<Future<Item = T, Error = Error> + Send> {
+    pub fn get(&self) -> ExpiryFut<T> {
         let s = (*self).clone();
         match self.remote.read() {
-            Ok(ref f) => Box::new(
+            Ok(ref f) => {
                 f.f.clone()
-                    .map_err(|e| ExpiryGetError::InnerFutureFailed(e).into())
-                    .and_then(move |item| s.get_or_update((*item).clone())),
-            ),
-            Err(e) => Box::new(
-                future::err(ExpiryGetError::PoisonedLock(e.to_string()).into()).into_future(),
-            ),
+                    .and_then(move |item| s.get_or_update(item))
+                    .boxed()
+            }
+            Err(e) => future::err::<T, ExpiryGetError>(ExpiryGetError::PoisonedLock(e.to_string()))
+                .boxed(),
         }
     }
 }
@@ -245,6 +256,7 @@ mod test_timed {
     use super::*;
     use chrono::DateTime;
     use chrono::Utc;
+    use futures::executor::block_on;
     use futures_timer::Delay;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
@@ -267,29 +279,26 @@ mod test_timed {
         }
     }
 
-    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(t: Result<T, Error>) {
+    fn check_ok_and_expiry<T: Expiry + Clone + 'static>(t: Result<T, ExpiryGetError>) {
         assert!(t.is_ok());
         let t = t.unwrap();
         assert!(t.valid());
     }
 
     impl Provider<E1> for P1 {
-        fn update(&self) -> Box<Future<Item = E1, Error = Error> + Send> {
-            println!("started update");
+        fn update(&self) -> ExpiryFut<E1> {
             let c = Arc::clone(&self.counter);
-            Box::new(
-                Delay::new(Duration::from_millis(10))
-                    .map(move |_| {
-                        println!("done update");
-                        c.fetch_add(1, Ordering::SeqCst);
-                        E1 {
-                            expire: Utc::now() + chrono::Duration::milliseconds(200),
-                            payload: String::from("foobar"),
-                        }
+            Delay::new(Duration::from_millis(10))
+                .map(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<E1, ExpiryGetError>(E1 {
+                        expire: Utc::now() + chrono::Duration::milliseconds(200),
+                        payload: String::from("foobar"),
                     })
-                    .map_err(Into::into)
-                    .into_future(),
-            )
+                })
+                .map_err(Into::into)
+                .into_future()
+                .boxed()
         }
     }
 
@@ -304,21 +313,23 @@ mod test_timed {
         };
         let counter = Arc::clone(&provider.counter);
         let rs = RemoteStore::new(provider);
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_ok_and_expiry(c);
 
         let mut threads = vec![];
         for _ in 0..10 {
             let rs_c = rs.clone();
             let child = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(50));
-                let c = rs_c.get().wait();
-                check_ok_and_expiry(c);
+                async move {
+                    thread::sleep(Duration::from_millis(50));
+                    let c = rs_c.get().await;
+                    check_ok_and_expiry(c);
+                }
             });
             threads.push(child);
         }
 
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_ok_and_expiry(c);
 
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
@@ -329,10 +340,10 @@ mod test_timed {
 
         let rs_c = rs.clone();
         let child = thread::spawn(move || {
-            let c = rs_c.get().wait();
+            let c = block_on(rs_c.get());
             check_ok_and_expiry(c);
         });
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_ok_and_expiry(c);
         assert!(child.join().is_ok());
         check_counter(&counter, 2);
@@ -343,7 +354,7 @@ mod test_timed {
         let rs = RemoteStore::new(P1 {
             counter: Arc::new(AtomicI64::default()),
         });
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_ok_and_expiry(c);
 
         let mut threads = vec![];
@@ -351,7 +362,7 @@ mod test_timed {
             let rs_c = rs.clone();
             let child = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(i * 10));
-                let c = rs_c.get().wait();
+                let c = block_on(rs_c.get());
                 check_ok_and_expiry(c);
             });
             threads.push(child);
@@ -359,11 +370,11 @@ mod test_timed {
 
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
     }
-
 }
 #[cfg(test)]
 mod test_counted {
     use super::*;
+    use futures::executor::block_on;
     use futures_timer::Delay;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
@@ -390,26 +401,25 @@ mod test_counted {
     }
 
     impl Provider<E2> for P2 {
-        fn update(&self) -> Box<Future<Item = E2, Error = Error> + Send> {
+        fn update(&self) -> ExpiryFut<E2> {
             let c = Arc::clone(&self.counter);
             let valid_for = self.valid_for;
-            Box::new(
-                Delay::new(Duration::from_millis(10))
-                    .map(move |_| {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        E2 {
-                            counter: Arc::new(AtomicI64::new(0)),
-                            payload: 0,
-                            valid_for,
-                        }
+            Delay::new(Duration::from_millis(10))
+                .map(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<E2, ExpiryGetError>(E2 {
+                        counter: Arc::new(AtomicI64::new(0)),
+                        payload: 0,
+                        valid_for,
                     })
-                    .map_err(Into::into)
-                    .into_future(),
-            )
+                })
+                .map_err(Into::into)
+                .into_future()
+                .boxed()
         }
     }
 
-    fn check_and_increment(t: Result<E2, Error>) {
+    fn check_and_increment(t: Result<E2, ExpiryGetError>) {
         assert!(t.is_ok());
         let t = t.unwrap();
         (*t.counter).fetch_add(1, Ordering::SeqCst);
@@ -427,7 +437,7 @@ mod test_counted {
         };
         let counter = Arc::clone(&provider.counter);
         let rs = RemoteStore::new(provider);
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_and_increment(c);
         check_counter(&counter, 1);
 
@@ -435,13 +445,13 @@ mod test_counted {
         for _ in 0..8 {
             let rs_c = rs.clone();
             let child = thread::spawn(move || {
-                let c = rs_c.get().wait();
+                let c = block_on(rs_c.get());
                 check_and_increment(c);
             });
             threads.push(child);
         }
 
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_and_increment(c);
 
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
@@ -449,10 +459,10 @@ mod test_counted {
 
         let rs_c = rs.clone();
         let child = thread::spawn(move || {
-            let c = rs_c.get().wait();
+            let c = block_on(rs_c.get());
             check_and_increment(c);
         });
-        let c = rs.get().wait();
+        let c = block_on(rs.get());
         check_and_increment(c);
         assert!(child.join().is_ok());
         check_counter(&counter, 2);
@@ -462,6 +472,7 @@ mod test_counted {
 #[cfg(test)]
 mod test_failing {
     use super::*;
+    use futures::executor::block_on;
     use std::thread;
     use std::time::Duration;
 
@@ -477,22 +488,24 @@ mod test_failing {
     }
 
     impl Provider<E3> for P3 {
-        fn update(&self) -> Box<Future<Item = E3, Error = Error> + Send> {
-            Box::new(future::err(ExpiryGetError::NotInitialized.into()).into_future())
+        fn update(&self) -> ExpiryFut<E3> {
+            future::err(ExpiryGetError::NotInitialized.into())
+                .into_future()
+                .boxed()
         }
     }
 
     #[test]
     fn many_threads_fail() {
         let rs = RemoteStore::new(P3 {});
-        let _ = rs.get().wait();
+        let _ = block_on(rs.get());
 
         let mut threads = vec![];
         for i in 0..30 {
             let rs_c = rs.clone();
             let child = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(i * 10));
-                let c = rs_c.get().wait();
+                let c = block_on(rs_c.get());
                 assert!(c.is_err());
             });
             threads.push(child);
