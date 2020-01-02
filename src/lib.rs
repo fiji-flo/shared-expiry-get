@@ -179,6 +179,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
     /// Wrap a [Provider](trait.Provider.html).
     #[allow(clippy::mutex_atomic)]
     pub fn new(p: P) -> Self {
+        info!("initializing from remote");
         let remote = Arc::new(RwLock::new(Fu {
             f: FutureExt::shared(p.update()),
         }));

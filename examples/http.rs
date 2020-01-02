@@ -1,11 +1,11 @@
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
-use futures::Future;
 use futures::FutureExt;
 use futures::TryFutureExt;
 use headers::CacheControl;
 use headers::HeaderMapExt;
+use log::info;
 use reqwest;
 use serde_json::Value;
 use shared_expiry_get::Expiry;
@@ -49,23 +49,38 @@ impl Provider<HttpGet> for HttpProvider {
     }
 }
 
-fn get() -> impl Future<Output = Result<(), ()>> {
+async fn get() -> Result<(), ()> {
     let remote_store = RemoteStore::new(HttpProvider {
         url: String::from("https://www.mozilla.org/contribute.json"),
     });
-    remote_store
-        .get()
-        .map_ok(|sf| {
-            println!("payload: '{}', valid until: {}", sf.payload, sf.valid_till);
-        })
-        .map_err(|e| {
-            println!("something went wrong: {}", e);
+    let res = remote_store.get().await;
+    match res {
+        Ok(sf) => Ok(info!(
+            "payload: '{}', valid until: {}",
+            sf.payload, sf.valid_till
+        )),
+        Err(e) => {
+            info!("something went wrong: {}", e);
             panic!();
-        })
+        }
+    }?;
+    let res = remote_store.get().await;
+    match res {
+        Ok(sf) => Ok(info!(
+            "payload: '{}', valid until: {}",
+            sf.payload, sf.valid_till
+        )),
+        Err(e) => {
+            info!("something went wrong: {}", e);
+            panic!();
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ::std::env::set_var("RUST_LOG", "http=info,shared_expiry_get=debug");
+    env_logger::init();
     let _ = tokio::spawn(get()).await?;
     Ok(())
 }
