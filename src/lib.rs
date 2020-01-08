@@ -191,6 +191,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
     }
 
     fn update(self) -> Shared<ExpiryFut<T>> {
+        debug!("lock for updating from remote");
         match self.inflight.lock() {
             Ok(mut lock) => {
                 if !*lock {
@@ -224,6 +225,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
     }
 
     fn get_or_update(self, t: T) -> ExpiryFut<T> {
+        debug!("get or update");
         if t.valid() {
             debug!("reusing cached data");
             future::ok::<T, ExpiryGetError>(t).boxed()
@@ -240,6 +242,7 @@ impl<T: Expiry + Clone + Sync + Send + 'static, P: Provider<T> + Sync + Send + '
         let s = (*self).clone();
         match self.remote.read() {
             Ok(ref f) => {
+                debug!("reading remote");
                 f.f.clone()
                     .and_then(move |item| s.get_or_update(item))
                     .boxed()
