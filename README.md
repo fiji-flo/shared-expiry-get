@@ -15,7 +15,6 @@ expiration criteria.
 
 `shared-expiry-get` does not:
 
-- do lazy initialization (first get happens at creation)
 - retry on error
 
 # Example Use Cases
@@ -26,15 +25,6 @@ expiration criteria.
 # A basic Example
 
 ```rust
-use failure::Error;
-use futures::future;
-use futures::future::IntoFuture;
-use futures::Future;
-
-use shared_expiry_get::Expiry;
-use shared_expiry_get::Provider;
-use shared_expiry_get::RemoteStore;
-
 #[derive(Clone)]
 struct MyProvider {}
 #[derive(Clone)]
@@ -47,14 +37,14 @@ impl Expiry for Payload {
 }
 
 impl Provider<Payload> for MyProvider {
-    fn update(&self) -> Box<Future<Item = Payload, Error = Error> + Send> {
-        Box::new(future::ok(Payload {}).into_future())
+    fn update(&self) -> ExpiryFut<Payload> {
+        future::ok::<Payload, ExpiryGetError>(Payload {}).into_future().boxed()
     }
 }
 
-fn main() {
+async fn main() {
     let rs = RemoteStore::new(MyProvider {});
-    let payload = rs.get().wait();
+    let payload = rs.get().await;
     assert!(payload.is_ok());
 }
 ```

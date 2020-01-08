@@ -5,7 +5,6 @@
 //! # A basic Example
 //!
 //! ```
-//! #[allow(clippy::needless_doctest_main)]
 //! use futures::executor::block_on;
 //! use futures::future;
 //! use futures::future::FutureExt;
@@ -15,6 +14,7 @@
 //! use std::pin::Pin;
 //!
 //! use shared_expiry_get::Expiry;
+//! use shared_expiry_get::ExpiryFut;
 //! use shared_expiry_get::ExpiryGetError;
 //! use shared_expiry_get::Provider;
 //! use shared_expiry_get::RemoteStore;
@@ -31,7 +31,7 @@
 //! }
 //!
 //! impl Provider<Payload> for MyProvider {
-//!     fn update(&self) -> Pin<Box<dyn Future<Output = Result<Payload, ExpiryGetError>> + Send>> {
+//!     fn update(&self) -> ExpiryFut<Payload> {
 //!         future::ok::<Payload, ExpiryGetError>(Payload {}).into_future().boxed()
 //!     }
 //! }
