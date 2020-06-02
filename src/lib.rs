@@ -323,12 +323,10 @@ mod test_timed {
         let mut threads = vec![];
         for _ in 0..10 {
             let rs_c = rs.clone();
-            let child = thread::spawn(move || {
-                async move {
-                    thread::sleep(Duration::from_millis(50));
-                    let c = rs_c.get().await;
-                    check_ok_and_expiry(c);
-                }
+            let child = thread::spawn(move || async move {
+                thread::sleep(Duration::from_millis(50));
+                let c = rs_c.get().await;
+                check_ok_and_expiry(c);
             });
             threads.push(child);
         }
