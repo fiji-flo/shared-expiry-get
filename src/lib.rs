@@ -372,6 +372,127 @@ mod test_timed {
 
         assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
     }
+
+    #[test]
+    fn many_threads_same_delay() {
+        let rs = RemoteStore::new(P1 {
+            counter: Arc::new(AtomicI64::default()),
+        });
+        let c = block_on(rs.get());
+        check_ok_and_expiry(c);
+
+        let mut threads = vec![];
+        for _ in 0..30 {
+            let rs_c = rs.clone();
+            let child = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(10));
+                let c = block_on(rs_c.get());
+                check_ok_and_expiry(c);
+            });
+            threads.push(child);
+        }
+
+        assert!(threads.into_iter().map(|c| c.join()).all(|j| j.is_ok()));
+    }
+}
+
+#[cfg(test)]
+mod test_async {
+    use super::*;
+    use futures::executor::block_on;
+    use futures::future::join_all;
+    use futures_timer::Delay;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    struct P2 {
+        counter: Arc<AtomicI64>,
+        valid_for: i64,
+    }
+
+    #[derive(Clone)]
+    struct E2 {
+        counter: Arc<AtomicI64>,
+        payload: usize,
+        valid_for: i64,
+    }
+
+    impl Expiry for E2 {
+        fn valid(&self) -> bool {
+            let c = self.counter.load(Ordering::SeqCst);
+            self.valid_for > c
+        }
+    }
+
+    impl Provider<E2> for P2 {
+        fn update(&self) -> ExpiryFut<E2> {
+            let c = Arc::clone(&self.counter);
+            let valid_for = self.valid_for;
+            Delay::new(Duration::from_millis(10))
+                .map(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<E2, ExpiryGetError>(E2 {
+                        counter: Arc::new(AtomicI64::new(0)),
+                        payload: 0,
+                        valid_for,
+                    })
+                })
+                .map_err(Into::into)
+                .into_future()
+                .boxed()
+        }
+    }
+
+    fn check_and_increment(t: Result<E2, ExpiryGetError>) {
+        assert!(t.is_ok());
+        let t = t.unwrap();
+        (*t.counter).fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn check_counter(counter: &Arc<AtomicI64>, should: i64) {
+        assert_eq!(counter.load(Ordering::SeqCst), should);
+    }
+
+    #[tokio::test]
+    async fn async_with_counter() {
+        let provider = P2 {
+            counter: Arc::new(AtomicI64::default()),
+            valid_for: 20,
+        };
+        let counter = Arc::clone(&provider.counter);
+        let rs = RemoteStore::new(provider);
+        let mut futs = vec![];
+        for _ in 0..19 {
+            let rs_c = rs.clone();
+            let fut = async move {
+                let c = rs_c.get().await;
+                check_and_increment(c);
+            };
+            futs.push(fut);
+        }
+
+        let c = rs.get().await;
+        check_and_increment(c);
+
+        join_all(futs).await;
+        check_counter(&counter, 1);
+
+        let rs_c = rs.clone();
+        let mut futs = vec![];
+        for _ in 0..3 {
+            let rs_c = rs.clone();
+            let fut = async move {
+                let c = rs_c.get().await;
+                check_and_increment(c);
+            };
+            futs.push(fut);
+        }
+
+        join_all(futs).await;
+        check_counter(&counter, 2);
+    }
 }
 #[cfg(test)]
 mod test_counted {
