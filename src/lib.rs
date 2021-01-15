@@ -399,12 +399,10 @@ mod test_timed {
 #[cfg(test)]
 mod test_async {
     use super::*;
-    use futures::executor::block_on;
     use futures::future::join_all;
     use futures_timer::Delay;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
-    use std::thread;
     use std::time::Duration;
 
     struct P2 {
@@ -479,7 +477,6 @@ mod test_async {
         join_all(futs).await;
         check_counter(&counter, 1);
 
-        let rs_c = rs.clone();
         let mut futs = vec![];
         for _ in 0..3 {
             let rs_c = rs.clone();
