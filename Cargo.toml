@@ -1,6 +1,6 @@
 [package]
 name = "shared-expiry-get"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Florian Merz <me@fiji-flo.de>"]
 description = "Simple concurrent async get with expiration for Rust"
 edition = "2018"
@@ -13,12 +13,12 @@ readme = "README.md"
 include = ["Cargo.toml", "src/**/*.rs", "README.md", "LICENSE"]
 
 [dependencies]
-failure = "0.1"
-failure_derive = "0.1"
+thiserror = "1"
 futures = "0.3"
 log = "0.4"
 
 [dev-dependencies]
+anyhow = "1"
 chrono = "0.4"
 futures-timer = "3.0"
 reqwest =  { version = "0.11", features = ["json"] }

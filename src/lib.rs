@@ -42,37 +42,34 @@
 //! assert!(payload.is_ok());
 //!
 //! ```
-extern crate failure;
-extern crate futures;
-#[macro_use]
-extern crate failure_derive;
-#[macro_use]
-extern crate log;
-
 use futures::future;
 use futures::future::FutureExt;
 use futures::future::Shared;
 use futures::future::TryFutureExt;
+use log::debug;
+use log::error;
+use log::info;
 use std::clone::Clone;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use thiserror::Error;
 
 /// Various internal errors.
-#[derive(Debug, Fail, Clone)]
+#[derive(Debug, Error, Clone)]
 pub enum ExpiryGetError {
     /// Internal `Mutex` or `RwLock` is poisoned.
-    #[fail(display = "Poisoned lock: {}", _0)]
+    #[error("Poisoned lock: {0}")]
     PoisonedLock(String),
     /// First `get` happened before initialization. This must not happen.
-    #[fail(display = "not initialized")]
+    #[error("not initialized")]
     NotInitialized,
     /// Something went wrong during update. Maybe a timeout or invalid data.
-    #[fail(display = "Inner update future failed: {}", _0)]
+    #[error("Inner update future failed: {0}")]
     InnerFutureFailed(String),
-    #[fail(display = "Update failed: {}", _0)]
+    #[error("Update failed: {0}")]
     UpdateFailed(String),
 }
 
@@ -121,7 +118,7 @@ pub trait Provider<T: Expiry + Clone + 'static> {
     ///
     /// Example:
     /// ```
-    /// # use failure::Error;
+    /// # use anyhow::Error;
     /// # use futures::future;
     /// # use futures::future::FutureExt;
     /// # use futures::future::IntoFuture;
